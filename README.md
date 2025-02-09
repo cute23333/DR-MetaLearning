@@ -1,8 +1,8 @@
 # DR-MetaLearning
-The reproduction code for the "Continual Adaptation of Visual Representations via Domain Randomization and Meta-learning". Unofficial.
+The reproduction code for the "Continual Adaptation of Visual Representations via Domain Randomization and Meta-learning". Unofficial. This repo only contain the digit datasets part, with 4 digit datasets and the resnet-18 model, and its training testing code.
 
-Sorry, I cannot successfully implement the MetaLearning step. So the repository only contains the code for Domain Randomization. 
+I implement the MetaLearning step by using the python package 'learn2learn'. see https://github.com/learnables/learn2learn
 
-The problem with MetaLearning is that it need to manually implement every layer's parameters of ResNet-18, which I think is poor in generalization. If you want to implement, you can refer to the pytorch code for MAML, which is highly similar. 
-
-I also find that there are some python packages that can help with this issue. Like some packages designed for Meta-Learning. But I haven't try them.
+To run this repo, first you need to download 4 datasets. MNIST, MNIST-M, SYN, SVHN. Put them in the data folder.
+Then pip install learn2learn. Run main.py.
+That's all, the code is simple.
