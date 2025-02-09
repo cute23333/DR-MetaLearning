@@ -4,6 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import learn2learn as l2l   # 我决定用learn2learn的maml来实现meta-dr
 
 from data_loader_trans2 import load_mnist_data, load_svhn_data, load_mnistm_data, load_syn_data
 from model import ResNet18
@@ -13,7 +14,6 @@ def main():
     parser = argparse.ArgumentParser(description='Continual Domain Adaptation')
     
     # 定义参数
-    # 先实现简单的digit，DR
     parser.add_argument('--task_type', type=str, default='digit recognition', help='the type of current task, include [digit recognition, PACS, Semantic scene segmentation]')
     parser.add_argument('--method', type=str, default='DR', help='include DR (domain randomization) and Meta-DR (meta-learning method in paper)')
     parser.add_argument('--protocols', type=int, default=1, help='the protocol of digit recognition, P1 or P2')
@@ -34,12 +34,13 @@ def main():
     # 解析参数
     args = parser.parse_args()
 
-    # 检查GPU是否可用并指定GPU编号为3
-    device = torch.device("cuda:2" if torch.cuda.is_available() and torch.cuda.device_count() > 2 else "cpu")
+    # 检查GPU是否可用并指定GPU编号
+    device = torch.device("cuda:3" if torch.cuda.is_available() and torch.cuda.device_count() > 2 else "cpu")
     print("Using device:", device)
 
-    # 模型构建
+    # 模型构建 这里改一下，用learn2learn的maml
     model = ResNet18().to(device)
+    model = l2l.algorithms.MAML(model, lr=args.alpha)
     
     # 训练准备
     criterion = nn.CrossEntropyLoss()
@@ -50,8 +51,7 @@ def main():
     # 训练过程
     for i in range(len(datasets)):
         dataset = datasets[i]
-        # 加载数据集
-        # 怎么把PIL的transform_set加进去？？？把batch的图像tensor转回numpy再应用转换。。。
+        # 加载数据集   咳咳，这里四个函数比较丑陋，以后可以改一改优雅一点
         if dataset == 'MNIST':
             train_loader, test_loader = load_mnist_data(batch_size=64)
         elif dataset == 'MNIST-M':
@@ -64,10 +64,10 @@ def main():
         # 手动调整学习率，第二个数据集开始减小学习率。这个很有用
         if i == 1:
             new_lr = args.learning_rate
-            # emmm，我的optimizer会不会没有更新，还对最开始那个param做更新
             for param_group in optimizer.param_groups:
                 param_group['lr'] = new_lr
             print(f'Learning rate adjusted to {new_lr}')
+
         model.train()
 
         train_iterator = iter(train_loader)
@@ -86,99 +86,25 @@ def main():
                 images_2, labels_2 = next(meta_iterator)
                 images_2, labels_2 = images_2.to(device), labels_2.to(device)
 
-                # print(labels == labels_2)  # 每次iter(loader)都会重新shuffle，所以每次images和images_2不一样
-
-                # theta_hat更新  这里transformation需要改！
+                # theta_hat更新  这里的transformation比较灵活，可以改成torch的批量操作
                 transformed_tensor_batch = batch_apply_transformation(images, 1, device)
 
+                # θ^Tt​←θt−α∇θ​LT​(T(x^),y^​;θt)
                 optimizer.zero_grad()
-                loss = criterion(model(images_2), labels_2)
-                loss.backward()
-                # clone()的特性值得深思 https://blog.csdn.net/weixin_43199584/article/details/106876679
-                grads = [param.grad.clone() for param in model.parameters()]  # (2,1)
+                task_model = model.clone()
+                adaptation_loss = criterion(task_model(transformed_tensor_batch), labels)
+                task_model.adapt(adaptation_loss)
 
-                optimizer.zero_grad()
-                # 对 model 的参数进行深拷贝
-                # theta_t = [param.clone().detach() for param in model.parameters()]
-                theta_t = [param.clone() for param in model.parameters()]
-
-                loss_meta = criterion(model(transformed_tensor_batch), labels)
-                loss_meta.backward()
-                # grads_meta = [param.grad.clone() for param in model.parameters()]  # (1,1)
-                # optimizer.step()
-                # 啊！这里要用alpha
-                new_lr = args.alpha
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-
-                optimizer.step()
-
-                if i==0:
-                    new_lr = args.first_learning_rate
-                else:
-                    new_lr = args.learning_rate
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = new_lr
-                # emm还不如eta呢
-                # 说明确实是梯度传播的问题。
-
+                # 这里就有一个问题，theta t 本身的loss是放到evalutation loss里，还是单独计算？
                 transformed_tensor_batch2 = batch_apply_transformation(images_2, 1, device)
-                optimizer.zero_grad()
-                loss_backward = criterion(model(images_2), labels_2)
-                loss_backward.backward()
-                grads_backward = [param.grad.clone() for param in model.parameters()]
-
-                optimizer.zero_grad()
-                loss_forward = criterion(model(transformed_tensor_batch2), labels_2)
-                loss_forward.backward()
-                grads_forward = [param.grad.clone() for param in model.parameters()]
-
-                with torch.no_grad():
-                    if i==0:
-                        lr = args.first_learning_rate
-                    else:
-                        lr = args.learning_rate
-                    for param, grad1, grad2, grad3 in zip(theta_t, grads, grads_backward, grads_forward):
-                        param -= lr * (grad1 + args.beta*grad2 + args.gama*grad3)  # 更新拷贝的参数
-                        # 这里有问题。grad2和grad3是对theta_hat的梯度，回传到theta_t还差一步。
                 
-                
-                for model_param, updated_param in zip(model.parameters(), theta_t):
-                    model_param.data.copy_(updated_param)
-                
-                '''
-                optimizer.zero_grad()
-                loss_meta = criterion(model(transformed_tensor_batch),labels)
-                loss_meta.backward()  # 获得了计算theta_hat的梯度，但是不更新
-                
-                # 计算hat_theta_T，不用torch.no_grad，便于之后梯度回传
-                theta_t = model.state_dict()  # 这里是浅拷贝，实质上还是原本的weights tensor …… 嗯？没有拷贝梯度过来？
-                hat_theta_T = {k: v - args.alpha * v.grad for k,v in theta_t.items()}  # 小心计算图不释放然后炸了。。测一下看需不需要手动释放计算图
-
-                optimizer.zero_grad()
-
-                outputs = model(images_2)
-                current_task_loss = criterion(outputs, labels_2)
-                
-                # 用新模型计算backward loss和forward loss
-                # model.load_state_dict(hat_theta_T)   # 这里有个问题，这个是深拷贝，会不会切断梯度传播。
-                for k,v in hat_theta_T.items():
-                    model.state_dict()[k].data.copy_(v)
-                
-                print('is equal??', theta_t == model.state_dict())  # 看一下copy_会不会影响到原来的theta_t
-                exit(0)
-                backward_loss = criterion(model(images_2), labels_2)
-
-                transformed_tensor_batch2 = batch_apply_transformation(images_2, 1, device)
-                forward_loss = criterion(model(transformed_tensor_batch2), labels_2)
-
-                loss = current_task_loss + args.beta * backward_loss + args.gama * forward_loss
-                model.load_state_dict(theta_t)  # 要更新原模型的梯度
-                loss.backward()
+                loss_backward = criterion(task_model(images_2), labels_2)
+                loss_forward = criterion(task_model(transformed_tensor_batch2), labels_2)
+                loss_current = criterion(model(images_2), labels_2)
+                evaluation_loss = loss_current + args.beta * loss_backward + args.gama * loss_forward
+                evaluation_loss.backward()
                 optimizer.step()
-
-                '''
-
+                
             except  StopIteration:
                 # print('重新装载')
                 train_iterator = iter(train_loader)
